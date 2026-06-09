@@ -1,6 +1,6 @@
 # Workflow A: Unprivileged — runs on pull_request (fork-safe).
-# Detects sensitive file changes and uploads the result as an artifact.
-# Never has write access or secrets — safe to checkout PR code.
+# Checks out the PR, detects sensitive file changes via git diff,
+# and uploads the result as an artifact for the privileged workflow.
 
 name: "Guard: Detect sensitive files"
 
@@ -16,23 +16,21 @@ jobs:
     env:
       SENSITIVE_FILES: ".claude/ AGENTS.md"
     steps:
-      - name: Detect sensitive file changes via API
-        id: detect
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          CHANGED_FILES=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" \
-            --paginate --jq '.[] | .filename, (.previous_filename // empty)')
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      - name: Detect sensitive file changes
+        run: |
+          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }})
           echo "=== Changed files ==="
-          echo "$CHANGED_FILES"
+          echo "$CHANGED"
 
           SENSITIVE_FOUND=false
           MODIFIED=""
           for pattern in $SENSITIVE_FILES; do
-            if echo "$CHANGED_FILES" | grep -qF "$pattern"; then
+            if echo "$CHANGED" | grep -qF "$pattern"; then
               echo "Sensitive file detected: $pattern"
               SENSITIVE_FOUND=true
               MODIFIED="${MODIFIED}${pattern}\n"
