@@ -1,0 +1,55 @@
+# Workflow A: Unprivileged — runs on pull_request (fork-safe).
+# Detects sensitive file changes and uploads the result as an artifact.
+# Never has write access or secrets — safe to checkout PR code.
+
+name: "Guard: Detect sensitive files"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SENSITIVE_FILES: ".claude/ AGENTS.md"
+    steps:
+      - name: Detect sensitive file changes via API
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          CHANGED_FILES=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+            --paginate --jq '.[] | .filename, (.previous_filename // empty)')
+
+          echo "=== Changed files ==="
+          echo "$CHANGED_FILES"
+
+          SENSITIVE_FOUND=false
+          MODIFIED=""
+          for pattern in $SENSITIVE_FILES; do
+            if echo "$CHANGED_FILES" | grep -qF "$pattern"; then
+              echo "Sensitive file detected: $pattern"
+              SENSITIVE_FOUND=true
+              MODIFIED="${MODIFIED}${pattern}\n"
+            fi
+          done
+
+          mkdir -p /tmp/guard-result
+          echo "$SENSITIVE_FOUND" > /tmp/guard-result/sensitive
+          echo "${{ github.event.pull_request.number }}" > /tmp/guard-result/pr_number
+          echo "${{ github.event.pull_request.head.sha }}" > /tmp/guard-result/head_sha
+          printf "$MODIFIED" > /tmp/guard-result/modified_files
+
+          echo "=== Sensitive: ${SENSITIVE_FOUND} ==="
+
+      - name: Upload detection result
+        uses: actions/upload-artifact@v4
+        with:
+          name: guard-result
+          path: /tmp/guard-result/
+          retention-days: 1

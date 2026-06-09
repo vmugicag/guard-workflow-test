@@ -1,0 +1,74 @@
+# Workflow B: Privileged — runs via workflow_run after detection completes.
+# Has write access and secrets. Reads sanitized artifact from Workflow A,
+# never touches PR code.
+
+name: "Guard: Enforce approval"
+
+on:
+  workflow_run:
+    workflows: ["Guard: Detect sensitive files"]
+    types: [completed]
+
+jobs:
+  enforce:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      statuses: write
+    env:
+      STATUS_CONTEXT: "AI Config Guard"
+    steps:
+      - name: Download detection artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: guard-result
+          path: /tmp/guard-result
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read detection result
+        id: result
+        run: |
+          SENSITIVE=$(cat /tmp/guard-result/sensitive)
+          PR_NUMBER=$(cat /tmp/guard-result/pr_number)
+          HEAD_SHA=$(cat /tmp/guard-result/head_sha)
+          MODIFIED=$(cat /tmp/guard-result/modified_files || true)
+
+          echo "sensitive=${SENSITIVE}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          if [ -n "$MODIFIED" ]; then
+            echo "modified_files<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$MODIFIED" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "PR #${PR_NUMBER}, SHA ${HEAD_SHA}, sensitive=${SENSITIVE}"
+
+      - name: Set status — no sensitive files changed
+        if: steps.result.outputs.sensitive != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api "repos/${REPO}/statuses/${HEAD_SHA}" \
+            -f state=success \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="No sensitive AI config files changed"
+
+      - name: Post comment and set failure status
+        if: steps.result.outputs.sensitive == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.result.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          REPO: ${{ github.repository }}
+          MODIFIED: ${{ steps.result.outputs.modified_files }}
+        run: |
+          gh pr comment "$PR_NUMBER" --body "**Guard Test**: Sensitive files detected — approval required."
+          gh api "repos/${REPO}/statuses/${HEAD_SHA}" \
+            -f state=failure \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="Sensitive AI config files changed — requires approval"
