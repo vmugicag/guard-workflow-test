@@ -1,8 +1,10 @@
-name: Guard Test (checkout + git diff)
+name: Guard Test (API-based, no checkout)
 
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted, dismissed]
 
 jobs:
   check-sensitive-files:
@@ -12,55 +14,68 @@ jobs:
       statuses: write
     env:
       SENSITIVE_FILES: ".claude/ AGENTS.md"
+      STATUS_CONTEXT: "AI Config Guard"
     steps:
-      - name: Checkout base branch
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Fetch PR head
+      - name: Resolve Pull Request Metadata
+        id: metadata
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          git fetch origin "pull/${PR_NUMBER}/head:pr-head"
-          echo "Base SHA: ${{ github.event.pull_request.base.sha }}"
-          echo "PR head SHA: $(git rev-parse pr-head)"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Resolved PR #${PR_NUMBER}, HEAD SHA: ${HEAD_SHA}"
 
-      - name: Detect sensitive file changes
-        id: detect
+      - name: Check if sensitive AI configs or workflows changed
+        id: check_sensitive_files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.metadata.outputs.pr_number }}
         run: |
-          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...pr-head)
-          echo "=== All changed files ==="
-          echo "$CHANGED"
-          echo ""
+          SENSITIVE_FILES_UPDATED=false
+          MODIFIED_FILES=""
 
-          SENSITIVE_FOUND=false
-          MODIFIED=""
-          for pattern in $SENSITIVE_FILES; do
-            MATCHES=$(echo "$CHANGED" | grep -F "$pattern" || true)
-            if [ -n "$MATCHES" ]; then
-              SENSITIVE_FOUND=true
-              while IFS= read -r f; do
-                MODIFIED="${MODIFIED}- \`${f}\`"$'\n'
-              done <<< "$MATCHES"
+          CHANGED_FILES=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+            --paginate --jq '.[] | .filename, (.previous_filename // empty)')
+
+          echo "=== Changed files ==="
+          echo "$CHANGED_FILES"
+
+          for file in $SENSITIVE_FILES; do
+            if echo "$CHANGED_FILES" | grep -qF "$file"; then
+              echo "Sensitive file detected: $file"
+              SENSITIVE_FILES_UPDATED=true
+              MODIFIED_FILES="${MODIFIED_FILES}- \`${file}\`"$'\n'
             fi
           done
 
-          echo "sensitive=${SENSITIVE_FOUND}" >> $GITHUB_OUTPUT
+          echo "detected=${SENSITIVE_FILES_UPDATED}" >> "$GITHUB_OUTPUT"
           echo ""
-          echo "=== Sensitive files detected: ${SENSITIVE_FOUND} ==="
-          if [ -n "$MODIFIED" ]; then
-            echo "$MODIFIED"
-          fi
+          echo "=== Sensitive files detected: ${SENSITIVE_FILES_UPDATED} ==="
 
-      - name: Post result comment
+      - name: Set status — no sensitive files changed
+        if: steps.check_sensitive_files.outputs.detected != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          SENSITIVE: ${{ steps.detect.outputs.sensitive }}
+          HEAD_SHA: ${{ steps.metadata.outputs.head_sha }}
+          REPO: ${{ github.repository }}
         run: |
-          if [ "$SENSITIVE" = "true" ]; then
-            gh pr comment "$PR_NUMBER" --body "**Guard Test**: Sensitive files detected — approval required."
-          else
-            gh pr comment "$PR_NUMBER" --body "**Guard Test**: No sensitive files changed — all clear."
-          fi
+          gh api "repos/${REPO}/statuses/${HEAD_SHA}" \
+            -f state=success \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="No sensitive AI config files changed"
+
+      - name: Post result comment
+        if: steps.check_sensitive_files.outputs.detected == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.metadata.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.metadata.outputs.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr comment "$PR_NUMBER" --body "**Guard Test**: Sensitive files detected — approval required."
+          gh api "repos/${REPO}/statuses/${HEAD_SHA}" \
+            -f state=failure \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="Sensitive AI config files changed — requires approval"
